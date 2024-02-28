@@ -4,7 +4,11 @@ import uuid
 from pathlib import Path
 
 import aiohttp
-import meilisearch
+from lingua import Language, LanguageDetectorBuilder
+from meilisearch import Client as MeilisearchClient
+from meilisearch.errors import (MeilisearchApiError,
+                                MeilisearchCommunicationError,
+                                MeilisearchTimeoutError)
 
 TIKA_URL = "http://localhost:9998"
 SEARCH_URL = "http://localhost:7700"
@@ -21,17 +25,23 @@ async def extract_content(path):
     logging.info(f"Extracting {path}")
     async with aiohttp.ClientSession(TIKA_URL) as session:
         async with session.put(
-            "/tika", data=data, headers={"Accept": "text/plain; charset=UTF-8"}
+            "/tika", data=data, headers={"Accept": "application/json; charset=UTF-8"}
         ) as response:
-            multiline_content = await response.text()
+            multiline_content = ""
+            match response.status:
+                case 200:
+                    multiline_content = await response.text()
+                case 204:
+                    logging.warning(f"Empty {path}")
+                case 422:
+                    raise Exception(f"Unprocessable {path}")
+                case 500:
+                    raise Exception(f"Error while processing {path}")
 
     logging.info(f"Done extracting {path}")
     return " ".join(
         multiline_content.splitlines()
     )  # Join line method not compatible with certain langs
-
-async def create_index(index, path, globs):
-    pass
 
 
 async def main():
@@ -44,34 +54,41 @@ async def main():
         datefmt="%m/%d/%Y %I:%M:%S %p",
     )
 
-    logging.info("Initializing.")
-    search_client = meilisearch.Client(SEARCH_URL)
-    search_client.delete_index(INDEX) # Clean old index
-
-    logging.info("Preprocessing.")
-    documents = []
-    contents = []
+    logging.info("Starting info extraction.")
+    extractions = []
     for glob in GLOBS:
         for path in Path(DIR).rglob(glob):
-            documents.append(
+            extractions.append(
                 {
-                    "id": str(uuid.uuid4()),
-                    "path": str(path),
+                    "path": str(path),  # Primary Key
                     "glob": glob,
-                    "content": "",
+                    "extraction_result": {"success": False, "text":""},
                 }
             )
             contents.append(extract_content(path))
 
-    logging.info("Starting info  extraction.")
     contents = await asyncio.gather(*contents)
 
     logging.info(f"Done info extraction with {len(contents)} files")
 
+    logging.info("Generating documents")
     for index, content in enumerate(contents):
-        documents[index]["content"] = content
+        extractions[index]["content"] = content
+    logging.info("Done generating documents")
 
-    search_client.index(INDEX).add_documents(documents)
+    logging.info(f"Adding documents to index queue")
+    search_client = MeilisearchClient(SEARCH_URL)
+    search_client.delete_index(INDEX)  # Clear old index, need better impl
+    search_client.create_index(INDEX, {"primaryKey": "path"})
+    search_client.index(INDEX).update_settings(
+        {
+            "searchableAttributes": ["path", "content", "glob"],
+            "displayedAttributes": ["path", "content", "glob"],
+            "filterableAttributes": ["glob"],
+        }
+    )
+    search_client.index(INDEX).add_documents(extractions)
+    logging.info(f"Done adding documents to index queue")
 
 
 asyncio.run(main())
